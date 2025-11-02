@@ -53,13 +53,20 @@ class CppGenerator(ASNVisitor):
 
     # --- TypeAssignment ------------------------------------------------
     def visitTypeAssignment(self, ctx):
-        # Try to extract type name robustly
+        # Try to extract type name from the parent assignment context
         name = None
-        for c in ctx.getChildren():
-            t = str(c)
-            if t.isidentifier():
-                name = t
-                break
+        parent = getattr(ctx, "parentCtx", None)
+        if parent and hasattr(parent, "IDENTIFIER"):
+            ident = parent.IDENTIFIER()
+            if ident:
+                name = ident.getText()
+        if not name:
+            # Fallback to scanning the children for an identifier token
+            for c in ctx.getChildren():
+                token_text = str(c)
+                if token_text.isidentifier():
+                    name = token_text
+                    break
         if not name:
             name = "AnonymousType"
 
@@ -114,20 +121,22 @@ class CppGenerator(ASNVisitor):
         for name, enum_ctx in self.enums:
             hpp.append(f"/** @brief ENUMERATED type {name} */")
             hpp.append(f"enum class {name} {{")
+            items = []
             if enum_ctx.enumerations() and enum_ctx.enumerations().rootEnumeration():
-                root_enum = enum_ctx.enumerations().rootEnumeration()
-                enum_items = root_enum.enumeration()
-
-                if not isinstance(enum_items, (list, tuple)):
-                    enum_items = [enum_items]
-
-                items = []
-                for e in enum_items:
-                    if e.namedNumber() and e.namedNumber().IDENTIFIER():
-                        ident = e.namedNumber().IDENTIFIER().getText()
-                    else:
-                        ident = "Unnamed"
-                    items.append(f"  {ident}")
+                enumeration = enum_ctx.enumerations().rootEnumeration().enumeration()
+                if enumeration:
+                    for item_ctx in enumeration.enumerationItem():
+                        ident = None
+                        if item_ctx.IDENTIFIER():
+                            ident = item_ctx.IDENTIFIER().getText()
+                        elif item_ctx.namedNumber() and item_ctx.namedNumber().IDENTIFIER():
+                            ident = item_ctx.namedNumber().IDENTIFIER().getText()
+                        elif item_ctx.value():
+                            ident = item_ctx.value().getText()
+                        if not ident:
+                            ident = "Unnamed"
+                        items.append(f"  {ident}")
+            if items:
                 hpp.append(",\n".join(items))
             hpp.append("};\n")
 
@@ -136,12 +145,26 @@ class CppGenerator(ASNVisitor):
             hpp.append(f"/** @brief SEQUENCE type {name} */")
             hpp.append(f"struct {name} {{")
             if seq_ctx.componentTypeLists():
-                for comp in seq_ctx.componentTypeLists().componentTypeList().componentType():
-                    field_name = comp.namedType().IDENTIFIER().getText()
-                    field_type = comp.namedType().asnType().getText()
-                    cpp_field_type = cpp_type(field_type)
-                    hpp.append(f"  /** @brief Field {field_name} of type {field_type} */")
-                    hpp.append(f"  {cpp_field_type} {field_name};")
+                comp_lists = seq_ctx.componentTypeLists().rootComponentTypeList()
+                if not isinstance(comp_lists, (list, tuple)):
+                    comp_lists = [comp_lists]
+                for comp_list in comp_lists:
+                    if not comp_list:
+                        continue
+                    ct_list = comp_list.componentTypeList()
+                    if not ct_list:
+                        continue
+                    for comp in ct_list.componentType():
+                        named = comp.namedType()
+                        if not named:
+                            continue
+                        if not named.IDENTIFIER():
+                            continue
+                        field_name = named.IDENTIFIER().getText()
+                        field_type = named.asnType().getText()
+                        cpp_field_type = cpp_type(field_type)
+                        hpp.append(f"  /** @brief Field {field_name} of type {field_type} */")
+                        hpp.append(f"  {cpp_field_type} {field_name};")
             hpp.append("")
             hpp.append("  /** @brief Encode this structure to ASN.1 binary form */")
             hpp.append("  std::vector<uint8_t> encode() const;")
@@ -155,10 +178,21 @@ class CppGenerator(ASNVisitor):
             hpp.append(f"struct {name} {{")
             hpp.append("  /** @brief Variant of all possible alternatives */")
             alts = []
-            if ch_ctx.alternativeTypeLists() and ch_ctx.alternativeTypeLists().rootAlternativeTypeList():
-                for alt in ch_ctx.alternativeTypeLists().rootAlternativeTypeList().namedType():
-                    field_type = cpp_type(alt.asnType().getText())
-                    alts.append(field_type)
+            if ch_ctx.alternativeTypeLists():
+                root_alts = ch_ctx.alternativeTypeLists().rootAlternativeTypeList()
+                if not isinstance(root_alts, (list, tuple)):
+                    root_alts = [root_alts]
+                for root_alt in root_alts:
+                    if not root_alt:
+                        continue
+                    alt_list = root_alt.alternativeTypeList()
+                    if not alt_list:
+                        continue
+                    for alt in alt_list.namedType():
+                        if not alt.asnType():
+                            continue
+                        field_type = cpp_type(alt.asnType().getText())
+                        alts.append(field_type)
             variant_decl = "std::variant<" + ", ".join(alts) + ">"
             hpp.append(f"  {variant_decl} value;")
             hpp.append("")
