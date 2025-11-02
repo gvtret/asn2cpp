@@ -9,6 +9,8 @@ Relies on generated parser classes in ./parser (ASNParser, ASNLexer, ASNVisitor)
 import sys
 import os
 import datetime
+import re
+from typing import Dict
 from antlr4 import *
 from parser.ASNLexer import ASNLexer
 from parser.ASNParser import ASNParser
@@ -35,21 +37,67 @@ def sanitize_identifier(name: str) -> str:
     return name.replace("-", "_")
 
 
+CONSTRAINT_MARKERS = ("{", "(", "[")
+
+
+def strip_constraints(asn_type: str) -> str:
+    """Remove constraint suffixes such as {...}, (...) or [...]."""
+    if not asn_type:
+        return ""
+    cut_positions = [
+        pos
+        for marker in CONSTRAINT_MARKERS
+        for pos in [asn_type.find(marker)]
+        if pos != -1
+    ]
+    if not cut_positions:
+        return asn_type
+    return asn_type[: min(cut_positions)]
+
+
+def normalize_type_name(asn_type: str) -> str:
+    """Strip constraints and sanitize an ASN.1 type reference."""
+    base = strip_constraints(asn_type)
+    return sanitize_identifier(base.strip())
+
+
+def type_key(asn_type: str) -> str:
+    """Return a canonical lookup key for type mapping."""
+    base = strip_constraints(asn_type)
+    if not base:
+        return ""
+    base = base.replace("-", " ")
+    base = base.replace("_", " ")
+    base = re.sub(r"\s+", " ", base).strip()
+    return base.upper()
+
+
 def cpp_type(asn_type: str) -> str:
     """Rough mapping from ASN.1 type to C++ type."""
-    m = {
+    type_map = {
         "INTEGER": "int",
         "BOOLEAN": "bool",
         "OCTET STRING": "std::vector<uint8_t>",
+        "OCTETSTRING": "std::vector<uint8_t>",
         "BIT STRING": "std::vector<bool>",
-        "VisibleString": "std::string",
-        "UTF8String": "std::string",
+        "BITSTRING": "std::vector<bool>",
+        "VISIBLESTRING": "std::string",
+        "UTF8STRING": "std::string",
+        "GRAPHICSTRING": "std::string",
+        "IA5STRING": "std::string",
+        "PRINTABLESTRING": "std::string",
+        "NUMERICSTRING": "std::string",
+        "GENERALIZEDTIME": "std::string",
+        "UTCTIME": "std::string",
         "ENUMERATED": "int",
-        "CHOICE": "std::variant<>",
-        "SEQUENCE": "struct",
+        "CHOICE": "std::variant<std::monostate>",
+        "SEQUENCE": "std::vector<uint8_t>",
         "NULL": "std::monostate",
+        "OBJECT IDENTIFIER": "std::vector<int>",
+        "OBJECTIDENTIFIER": "std::vector<int>",
     }
-    return m.get(asn_type, sanitize_identifier(asn_type))
+    key = type_key(asn_type)
+    return type_map.get(key, sanitize_identifier(normalize_type_name(asn_type)))
 
 
 # ---------------------------------------------------------------------
@@ -61,6 +109,11 @@ class CppGenerator(ASNVisitor):
         self.types = []
         self.enums = []
         self.choices = []
+        self.simple_types = []
+        self.sequence_of = []
+        self.type_kinds: Dict[str, str] = {}
+        self.inline_names: Dict[int, str] = {}
+        self.inline_counter = 0
 
     # --- TypeAssignment ------------------------------------------------
     def visitTypeAssignment(self, ctx):
@@ -83,13 +136,235 @@ class CppGenerator(ASNVisitor):
         name = sanitize_identifier(name)
 
         asn = ctx.asnType()
-        if asn.builtinType() and asn.builtinType().sequenceType():
-            self.types.append((name, asn.builtinType().sequenceType()))
-        elif asn.builtinType() and asn.builtinType().enumeratedType():
-            self.enums.append((name, asn.builtinType().enumeratedType()))
-        elif asn.builtinType() and asn.builtinType().choiceType():
-            self.choices.append((name, asn.builtinType().choiceType()))
+        builtin = asn.builtinType() if asn and hasattr(asn, "builtinType") else None
+        defined = asn.definedType() if asn and hasattr(asn, "definedType") else None
+        if builtin and builtin.sequenceType():
+            self.types.append((name, builtin.sequenceType()))
+            self.type_kinds[name] = "sequence"
+        elif (
+            builtin
+            and getattr(builtin, "sequenceOfType", None)
+            and builtin.sequenceOfType()
+        ):
+            self.sequence_of.append((name, builtin.sequenceOfType()))
+            self.type_kinds[name] = "sequence_of"
+        elif builtin and builtin.enumeratedType():
+            self.enums.append((name, builtin.enumeratedType()))
+            self.type_kinds[name] = "enum"
+        elif builtin and builtin.choiceType():
+            self.choices.append((name, builtin.choiceType()))
+            self.type_kinds[name] = "choice"
+        else:
+            target = ""
+            if builtin:
+                target = builtin.getText()
+            elif defined:
+                target = defined.getText()
+            else:
+                target = asn.getText() if asn else ""
+            self.simple_types.append((name, target))
+            self.type_kinds[name] = "alias"
         return self.visitChildren(ctx)
+
+    # --- Helpers --------------------------------------------------------
+    def _unique_inline_name(self, base: str) -> str:
+        candidate = sanitize_identifier(base) or f"InlineType{self.inline_counter}"
+        name = candidate
+        suffix = 1
+        while name in self.type_kinds:
+            name = f"{candidate}_{suffix}"
+            suffix += 1
+        self.inline_counter += 1
+        return name
+
+    def _cache_inline(self, ctx, name: str, kind: str):
+        key = id(ctx)
+        cached = self.inline_names.get(key)
+        if cached:
+            return cached
+        self.inline_names[key] = name
+        if kind == "sequence":
+            self.types.append((name, ctx))
+        elif kind == "choice":
+            self.choices.append((name, ctx))
+        elif kind == "enum":
+            self.enums.append((name, ctx))
+        self.type_kinds[name] = kind
+        return name
+
+    def _ensure_inline_sequence(self, owner: str, ctx):
+        key = id(ctx)
+        if key in self.inline_names:
+            return self.inline_names[key]
+        name = self._unique_inline_name(f"{owner}_Sequence")
+        return self._cache_inline(ctx, name, "sequence")
+
+    def _ensure_inline_choice(self, owner: str, ctx):
+        key = id(ctx)
+        if key in self.inline_names:
+            return self.inline_names[key]
+        name = self._unique_inline_name(f"{owner}_Choice")
+        return self._cache_inline(ctx, name, "choice")
+
+    def _ensure_inline_enum(self, owner: str, ctx):
+        key = id(ctx)
+        if key in self.inline_names:
+            return self.inline_names[key]
+        name = self._unique_inline_name(f"{owner}_Enum")
+        return self._cache_inline(ctx, name, "enum")
+
+    def _wrap_defined(self, name: str, usage: str) -> str:
+        if usage == "alias":
+            return name
+        kind = self.type_kinds.get(name)
+        if kind in {"sequence", "choice", "sequence_of"}:
+            return f"std::shared_ptr<{name}>"
+        return name
+
+    def render_type_from_ctx(self, asn_type_ctx, usage: str, owner: str) -> str:
+        if asn_type_ctx is None:
+            return "std::monostate"
+        if hasattr(asn_type_ctx, "definedType") and asn_type_ctx.definedType():
+            target = normalize_type_name(asn_type_ctx.definedType().getText())
+            return self._wrap_defined(target, usage)
+        if hasattr(asn_type_ctx, "referencedType") and asn_type_ctx.referencedType():
+            ref = asn_type_ctx.referencedType()
+            if ref.definedType():
+                text = ref.definedType().getText()
+                mapped = cpp_type(text)
+                normalized = normalize_type_name(text)
+                if mapped and mapped != normalized:
+                    return mapped
+                return self._wrap_defined(normalized, usage)
+            text = ref.getText()
+            normalized = normalize_type_name(text)
+            if normalized in self.type_kinds:
+                return self._wrap_defined(normalized, usage)
+            mapped = cpp_type(text)
+            if mapped and mapped != normalized:
+                return mapped
+            return normalized
+        builtin = (
+            asn_type_ctx.builtinType() if hasattr(asn_type_ctx, "builtinType") else None
+        )
+        if not builtin:
+            return cpp_type(asn_type_ctx.getText())
+        if getattr(builtin, "sequenceOfType", None) and builtin.sequenceOfType():
+            seq_of = builtin.sequenceOfType()
+            element_ctx = seq_of.asnType()
+            if not element_ctx and seq_of.namedType():
+                element_ctx = seq_of.namedType().asnType()
+            element_type = self.render_type_from_ctx(
+                element_ctx, "sequence_element", owner
+            )
+            if not element_type:
+                element_type = "std::monostate"
+            return f"std::vector<{element_type}>"
+        if builtin.choiceType():
+            inline_name = self._ensure_inline_choice(owner, builtin.choiceType())
+            return self._wrap_defined(inline_name, usage)
+        if builtin.sequenceType():
+            inline_name = self._ensure_inline_sequence(owner, builtin.sequenceType())
+            return self._wrap_defined(inline_name, usage)
+        if builtin.enumeratedType():
+            inline_name = self._ensure_inline_enum(owner, builtin.enumeratedType())
+            return self._wrap_defined(inline_name, usage)
+        return cpp_type(builtin.getText())
+
+    def render_reference_from_text(self, text: str, usage: str, owner: str) -> str:
+        key = type_key(text)
+        mapped = cpp_type(text)
+        if key in {
+            "INTEGER",
+            "BOOLEAN",
+            "OCTET STRING",
+            "OCTETSTRING",
+            "BIT STRING",
+            "BITSTRING",
+            "VISIBLESTRING",
+            "UTF8STRING",
+            "GRAPHICSTRING",
+            "IA5STRING",
+            "PRINTABLESTRING",
+            "NUMERICSTRING",
+            "GENERALIZEDTIME",
+            "UTCTIME",
+            "ENUMERATED",
+            "CHOICE",
+            "SEQUENCE",
+            "NULL",
+            "OBJECT IDENTIFIER",
+            "OBJECTIDENTIFIER",
+        }:
+            return mapped
+        if "SEQUENCE" in key and "OF" in key:
+            parts = text.split("OF", 1)
+            element = parts[1] if len(parts) > 1 else "std::monostate"
+            element_type = self.render_reference_from_text(
+                element, "sequence_element", owner
+            )
+            return f"std::vector<{element_type}>"
+        normalized = normalize_type_name(text)
+        if normalized in self.type_kinds:
+            return self._wrap_defined(normalized, usage)
+        return self._wrap_defined(normalized, usage)
+
+    def _prepare_inline_types(self):
+        # Force discovery of inline types before emitting declarations.
+        for name, seq_ctx in list(self.types):
+            if not seq_ctx.componentTypeLists():
+                continue
+            comp_lists = seq_ctx.componentTypeLists().rootComponentTypeList()
+            if not isinstance(comp_lists, (list, tuple)):
+                comp_lists = [comp_lists]
+            for comp_list in comp_lists:
+                if not comp_list:
+                    continue
+                ct_list = comp_list.componentTypeList()
+                if not ct_list:
+                    continue
+                for comp in ct_list.componentType():
+                    named = comp.namedType()
+                    if not named or not named.asnType():
+                        continue
+                    field_name = (
+                        sanitize_identifier(named.IDENTIFIER().getText())
+                        if named.IDENTIFIER()
+                        else "field"
+                    )
+                    self.render_type_from_ctx(
+                        named.asnType(), "field", f"{name}_{field_name}"
+                    )
+        for name, ch_ctx in list(self.choices):
+            if not ch_ctx.alternativeTypeLists():
+                continue
+            root_alts = ch_ctx.alternativeTypeLists().rootAlternativeTypeList()
+            if not isinstance(root_alts, (list, tuple)):
+                root_alts = [root_alts]
+            for root_alt in root_alts:
+                if not root_alt:
+                    continue
+                alt_list = root_alt.alternativeTypeList()
+                if not alt_list:
+                    continue
+                for idx, alt in enumerate(alt_list.namedType()):
+                    if not alt.asnType():
+                        continue
+                    alt_name = (
+                        alt.IDENTIFIER().getText() if alt.IDENTIFIER() else f"alt_{idx}"
+                    )
+                    self.render_type_from_ctx(
+                        alt.asnType(),
+                        "variant",
+                        f"{name}_{sanitize_identifier(alt_name)}",
+                    )
+        for name, seq_ctx in list(self.sequence_of):
+            element_ctx = seq_ctx.asnType()
+            if not element_ctx and seq_ctx.namedType():
+                element_ctx = seq_ctx.namedType().asnType()
+            self.render_type_from_ctx(
+                element_ctx, "sequence_element", f"{name}_element"
+            )
 
     # --- SEQUENCE ------------------------------------------------------
     def visitSequenceType(self, ctx):
@@ -113,6 +388,9 @@ class CppGenerator(ASNVisitor):
         guard = header_guard(hpp_name)
         date_str = iso_datetime()
 
+        # Ensure inline types are registered before emitting code.
+        self._prepare_inline_types()
+
         # --- HEADER FILE ---
         hpp = []
         hpp.append(f"/**")
@@ -128,8 +406,34 @@ class CppGenerator(ASNVisitor):
         hpp.append("#include <string>")
         hpp.append("#include <vector>")
         hpp.append("#include <variant>")
+        hpp.append("#include <memory>")
         hpp.append("#include <cstdint>\n")
         hpp.append("namespace DLMS {\n")
+
+        # --- FORWARD DECLARATIONS ---
+        for name, _ in list(self.types) + list(self.choices):
+            hpp.append(f"struct {name};")
+        if self.types or self.choices:
+            hpp.append("")
+
+        # --- SIMPLE TYPE ALIASES ---
+        for name, target in self.simple_types:
+            resolved = self.render_reference_from_text(target, "alias", name)
+            doc_target = strip_constraints(target).strip() or target
+            hpp.append(f"/** @brief TYPE {name} aliases ASN.1 {doc_target} */")
+            hpp.append(f"using {name} = {resolved};\n")
+
+        # --- SEQUENCE OF TYPES ---
+        for name, seq_ctx in self.sequence_of:
+            element_ctx = seq_ctx.asnType()
+            if not element_ctx and seq_ctx.namedType():
+                element_ctx = seq_ctx.namedType().asnType()
+            element_type = self.render_type_from_ctx(
+                element_ctx, "sequence_element", f"{name}_element"
+            )
+            doc_target = seq_ctx.getText()
+            hpp.append(f"/** @brief TYPE {name} aliases ASN.1 {doc_target} */")
+            hpp.append(f"using {name} = std::vector<{element_type}>;\n")
 
         # --- ENUMERATED TYPES ---
         for name, enum_ctx in self.enums:
@@ -179,7 +483,9 @@ class CppGenerator(ASNVisitor):
                             continue
                         field_name = sanitize_identifier(named.IDENTIFIER().getText())
                         field_type = named.asnType().getText()
-                        cpp_field_type = cpp_type(field_type)
+                        cpp_field_type = self.render_type_from_ctx(
+                            named.asnType(), "field", f"{name}_{field_name}"
+                        )
                         hpp.append(
                             f"  /** @brief Field {field_name} of type {field_type} */"
                         )
@@ -210,8 +516,19 @@ class CppGenerator(ASNVisitor):
                     for alt in alt_list.namedType():
                         if not alt.asnType():
                             continue
-                        field_type = cpp_type(alt.asnType().getText())
+                        alt_name = (
+                            alt.IDENTIFIER().getText()
+                            if alt.IDENTIFIER()
+                            else f"alt_{len(alts)}"
+                        )
+                        field_type = self.render_type_from_ctx(
+                            alt.asnType(),
+                            "variant",
+                            f"{name}_{sanitize_identifier(alt_name)}",
+                        )
                         alts.append(field_type)
+            if not alts:
+                alts.append("std::monostate")
             variant_decl = "std::variant<" + ", ".join(alts) + ">"
             hpp.append(f"  {variant_decl} value;")
             hpp.append("")
