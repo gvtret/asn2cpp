@@ -106,7 +106,12 @@ def cpp_type(asn_type: str) -> str:
 # ---------------------------------------------------------------------
 class CppGenerator(ASNVisitor):
     def __init__(
-        self, module_name, *, generate_cpp: bool = True, overwrite_cpp: bool = False
+        self,
+        module_name,
+        *,
+        generate_cpp: bool = True,
+        overwrite_cpp: bool = False,
+        output_dir: str = ".",
     ):
         self.module_name = module_name
         self.types = []
@@ -119,6 +124,7 @@ class CppGenerator(ASNVisitor):
         self.inline_counter = 0
         self.generate_cpp = generate_cpp
         self.overwrite_cpp = overwrite_cpp
+        self.output_dir = os.path.abspath(output_dir or ".")
 
     # --- TypeAssignment ------------------------------------------------
     def visitTypeAssignment(self, ctx):
@@ -390,6 +396,8 @@ class CppGenerator(ASNVisitor):
     def generate(self):
         hpp_name = f"{self.module_name}.hpp"
         cpp_name = f"{self.module_name}.cpp"
+        hpp_path = os.path.join(self.output_dir, hpp_name)
+        cpp_path = os.path.join(self.output_dir, cpp_name)
         guard = header_guard(hpp_name)
         date_str = iso_datetime()
 
@@ -569,23 +577,25 @@ class CppGenerator(ASNVisitor):
             cpp.append("} // namespace DLMS\n")
 
         # --- Write files ---
-        with open(hpp_name, "w", encoding="utf-8") as f:
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        with open(hpp_path, "w", encoding="utf-8") as f:
             f.write("\n".join(hpp))
-        message = [f"Generated: {hpp_name}"]
+        message = [f"Generated: {hpp_path}"]
         if self.generate_cpp:
-            if os.path.exists(cpp_name) and not self.overwrite_cpp:
+            if os.path.exists(cpp_path) and not self.overwrite_cpp:
                 message.append(
-                    f"Preserved existing {cpp_name}; use --overwrite-cpp to regenerate."
+                    f"Preserved existing {cpp_path}; use --overwrite-cpp to regenerate."
                 )
             else:
-                with open(cpp_name, "w", encoding="utf-8") as f:
+                with open(cpp_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(cpp))
-                message[0] = f"Generated: {hpp_name}, {cpp_name}"
+                message[0] = f"Generated: {hpp_path}, {cpp_path}"
         else:
-            if os.path.exists(cpp_name):
-                message.append(f"Skipped regeneration of existing {cpp_name}.")
+            if os.path.exists(cpp_path):
+                message.append(f"Skipped regeneration of existing {cpp_path}.")
             else:
-                message.append(f"Skipped cpp generation; {cpp_name} not created.")
+                message.append(f"Skipped cpp generation; {cpp_path} not created.")
         print(" ".join(message))
 
 
@@ -607,6 +617,12 @@ def main():
         action="store_true",
         help="Regenerate the cpp file even if it already exists.",
     )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        default=".",
+        help="Directory where generated files will be written.",
+    )
     args = parser.parse_args()
 
     input_file = args.input
@@ -622,6 +638,7 @@ def main():
         module_name,
         generate_cpp=not args.header_only,
         overwrite_cpp=args.overwrite_cpp,
+        output_dir=args.output_dir,
     )
     visitor.visit(tree)
     visitor.generate()
