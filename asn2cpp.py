@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 asn2cpp_antlr.py
-Auto-generates C++11 code from ASN.1 definitions using ANTLR4 grammar.
+Auto-generates C++ code (C++11/C++14/C++17) from ASN.1 definitions using ANTLR4 grammar.
 Relies on generated parser classes in ./parser (ASNParser, ASNLexer, ASNVisitor).
 """
 
@@ -34,9 +34,101 @@ def header_guard(name: str):
 def sanitize_identifier(name: str) -> str:
     """Replace characters that are invalid in C++ identifiers."""
     if not name:
-        return name
-    return name.replace("-", "_")
+        return ""
+    sanitized = re.sub(r"\W", "_", name.strip())
+    if sanitized and sanitized[0].isdigit():
+        sanitized = f"_{sanitized}"
+    if sanitized.lower() in CPP_KEYWORDS:
+        sanitized = f"{sanitized}_"
+    return sanitized
 
+
+CPP_KEYWORDS = {
+    "alignas",
+    "alignof",
+    "and",
+    "and_eq",
+    "asm",
+    "auto",
+    "bitand",
+    "bitor",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "char16_t",
+    "char32_t",
+    "class",
+    "compl",
+    "const",
+    "constexpr",
+    "const_cast",
+    "continue",
+    "decltype",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "dynamic_cast",
+    "else",
+    "enum",
+    "explicit",
+    "export",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "friend",
+    "goto",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "mutable",
+    "namespace",
+    "new",
+    "noexcept",
+    "not",
+    "not_eq",
+    "nullptr",
+    "operator",
+    "or",
+    "or_eq",
+    "private",
+    "protected",
+    "public",
+    "register",
+    "reinterpret_cast",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "static_assert",
+    "static_cast",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "thread_local",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typeid",
+    "typename",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "wchar_t",
+    "while",
+    "xor",
+    "xor_eq",
+}
 
 CONSTRAINT_MARKERS = ("{", "(", "[")
 
@@ -73,7 +165,9 @@ def type_key(asn_type: str) -> str:
     return base.upper()
 
 
-def cpp_type(asn_type: str) -> str:
+def cpp_type(
+    asn_type: str, *, null_type: str = "NullType", use_variant: bool = False
+) -> str:
     """Rough mapping from ASN.1 type to C++ type."""
     type_map = {
         "INTEGER": "int",
@@ -91,12 +185,15 @@ def cpp_type(asn_type: str) -> str:
         "GENERALIZEDTIME": "std::string",
         "UTCTIME": "std::string",
         "ENUMERATED": "int",
-        "CHOICE": "std::variant<std::monostate>",
         "SEQUENCE": "std::vector<uint8_t>",
-        "NULL": "std::monostate",
+        "NULL": null_type,
         "OBJECT IDENTIFIER": "std::vector<int>",
         "OBJECTIDENTIFIER": "std::vector<int>",
     }
+    if use_variant:
+        type_map["CHOICE"] = f"std::variant<{null_type}>"
+    else:
+        type_map["CHOICE"] = null_type
     key = type_key(asn_type)
     return type_map.get(key, sanitize_identifier(normalize_type_name(asn_type)))
 
@@ -112,6 +209,7 @@ class CppGenerator(ASNVisitor):
         generate_cpp: bool = True,
         overwrite_cpp: bool = False,
         output_dir: str = ".",
+        cpp_standard: str = "c++17",
     ):
         self.module_name = module_name
         self.types = []
@@ -125,6 +223,9 @@ class CppGenerator(ASNVisitor):
         self.generate_cpp = generate_cpp
         self.overwrite_cpp = overwrite_cpp
         self.output_dir = os.path.abspath(output_dir or ".")
+        self.cpp_standard = cpp_standard
+        self.use_variant = cpp_standard == "c++17"
+        self.null_type = "std::monostate" if self.use_variant else "NullType"
 
     # --- TypeAssignment ------------------------------------------------
     def visitTypeAssignment(self, ctx):
@@ -210,6 +311,24 @@ class CppGenerator(ASNVisitor):
         name = self._unique_inline_name(f"{owner}_Sequence")
         return self._cache_inline(ctx, name, "sequence")
 
+    @staticmethod
+    def _safe_identifier(name: str, fallback: str) -> str:
+        candidate = sanitize_identifier(name) or fallback
+        if candidate[0].isdigit():
+            candidate = f"_{candidate}"
+        return candidate
+
+    @staticmethod
+    def _unique_choice_token(base: str, existing: set, fallback: str) -> str:
+        candidate = CppGenerator._safe_identifier(base, fallback)
+        original = candidate
+        suffix = 1
+        while candidate in existing:
+            candidate = f"{original}_{suffix}"
+            suffix += 1
+        existing.add(candidate)
+        return candidate
+
     def _ensure_inline_choice(self, owner: str, ctx):
         key = id(ctx)
         if key in self.inline_names:
@@ -234,7 +353,7 @@ class CppGenerator(ASNVisitor):
 
     def render_type_from_ctx(self, asn_type_ctx, usage: str, owner: str) -> str:
         if asn_type_ctx is None:
-            return "std::monostate"
+            return self.null_type
         if hasattr(asn_type_ctx, "definedType") and asn_type_ctx.definedType():
             target = normalize_type_name(asn_type_ctx.definedType().getText())
             return self._wrap_defined(target, usage)
@@ -242,7 +361,9 @@ class CppGenerator(ASNVisitor):
             ref = asn_type_ctx.referencedType()
             if ref.definedType():
                 text = ref.definedType().getText()
-                mapped = cpp_type(text)
+                mapped = cpp_type(
+                    text, null_type=self.null_type, use_variant=self.use_variant
+                )
                 normalized = normalize_type_name(text)
                 if mapped and mapped != normalized:
                     return mapped
@@ -251,7 +372,9 @@ class CppGenerator(ASNVisitor):
             normalized = normalize_type_name(text)
             if normalized in self.type_kinds:
                 return self._wrap_defined(normalized, usage)
-            mapped = cpp_type(text)
+            mapped = cpp_type(
+                text, null_type=self.null_type, use_variant=self.use_variant
+            )
             if mapped and mapped != normalized:
                 return mapped
             return normalized
@@ -259,7 +382,11 @@ class CppGenerator(ASNVisitor):
             asn_type_ctx.builtinType() if hasattr(asn_type_ctx, "builtinType") else None
         )
         if not builtin:
-            return cpp_type(asn_type_ctx.getText())
+            return cpp_type(
+                asn_type_ctx.getText(),
+                null_type=self.null_type,
+                use_variant=self.use_variant,
+            )
         if getattr(builtin, "sequenceOfType", None) and builtin.sequenceOfType():
             seq_of = builtin.sequenceOfType()
             element_ctx = seq_of.asnType()
@@ -269,7 +396,7 @@ class CppGenerator(ASNVisitor):
                 element_ctx, "sequence_element", owner
             )
             if not element_type:
-                element_type = "std::monostate"
+                element_type = self.null_type
             return f"std::vector<{element_type}>"
         if builtin.choiceType():
             inline_name = self._ensure_inline_choice(owner, builtin.choiceType())
@@ -280,11 +407,13 @@ class CppGenerator(ASNVisitor):
         if builtin.enumeratedType():
             inline_name = self._ensure_inline_enum(owner, builtin.enumeratedType())
             return self._wrap_defined(inline_name, usage)
-        return cpp_type(builtin.getText())
+        return cpp_type(
+            builtin.getText(), null_type=self.null_type, use_variant=self.use_variant
+        )
 
     def render_reference_from_text(self, text: str, usage: str, owner: str) -> str:
         key = type_key(text)
-        mapped = cpp_type(text)
+        mapped = cpp_type(text, null_type=self.null_type, use_variant=self.use_variant)
         if key in {
             "INTEGER",
             "BOOLEAN",
@@ -310,7 +439,7 @@ class CppGenerator(ASNVisitor):
             return mapped
         if "SEQUENCE" in key and "OF" in key:
             parts = text.split("OF", 1)
-            element = parts[1] if len(parts) > 1 else "std::monostate"
+            element = parts[1] if len(parts) > 1 else self.null_type
             element_type = self.render_reference_from_text(
                 element, "sequence_element", owner
             )
@@ -535,16 +664,25 @@ class CppGenerator(ASNVisitor):
             f" * @brief Auto-generated C++ types from ASN.1 module {self.module_name}"
         )
         hpp.append(f" * @date {date_str}")
+        hpp.append(f" * @note Target C++ standard: {self.cpp_standard}")
         hpp.append(f" * @generated by asn2cpp_antlr.py")
         hpp.append(f" */\n")
         hpp.append(f"#ifndef {guard}")
         hpp.append(f"#define {guard}\n")
         hpp.append("#include <string>")
         hpp.append("#include <vector>")
-        hpp.append("#include <variant>")
+        if self.use_variant:
+            hpp.append("#include <variant>")
         hpp.append("#include <memory>")
         hpp.append("#include <cstdint>\n")
         hpp.append("namespace DLMS {\n")
+
+        if self.null_type == "NullType":
+            hpp.append(
+                "/** @brief Placeholder type for ASN.1 NULL when std::monostate is unavailable */"
+            )
+            hpp.append("struct NullType {};")
+            hpp.append("")
 
         # --- FORWARD DECLARATIONS ---
         for name, _ in list(self.types) + list(self.choices):
@@ -637,8 +775,9 @@ class CppGenerator(ASNVisitor):
         for name, ch_ctx in self.choices:
             hpp.append(f"/** @brief CHOICE type {name} */")
             hpp.append(f"struct {name} {{")
-            hpp.append("  /** @brief Variant of all possible alternatives */")
-            alts = []
+            alternatives = []
+            enum_tokens = set()
+            field_tokens = set()
             if ch_ctx.alternativeTypeLists():
                 root_alts = ch_ctx.alternativeTypeLists().rootAlternativeTypeList()
                 if not isinstance(root_alts, (list, tuple)):
@@ -649,24 +788,60 @@ class CppGenerator(ASNVisitor):
                     alt_list = root_alt.alternativeTypeList()
                     if not alt_list:
                         continue
-                    for alt in alt_list.namedType():
+                    for idx, alt in enumerate(alt_list.namedType()):
                         if not alt.asnType():
                             continue
-                        alt_name = (
+                        raw_label = (
                             alt.IDENTIFIER().getText()
                             if alt.IDENTIFIER()
-                            else f"alt_{len(alts)}"
+                            else f"Alternative{idx}"
+                        )
+                        enum_name = self._unique_choice_token(
+                            raw_label, enum_tokens, f"Alternative{idx}"
+                        )
+                        field_name = self._unique_choice_token(
+                            f"{enum_name}_value",
+                            field_tokens,
+                            f"alternative_{idx}_value",
                         )
                         field_type = self.render_type_from_ctx(
                             alt.asnType(),
                             "variant",
-                            f"{name}_{sanitize_identifier(alt_name)}",
+                            f"{name}_{enum_name}",
                         )
-                        alts.append(field_type)
-            if not alts:
-                alts.append("std::monostate")
-            variant_decl = "std::variant<" + ", ".join(alts) + ">"
-            hpp.append(f"  {variant_decl} value;")
+                        alternatives.append(
+                            {
+                                "enum": enum_name,
+                                "field": field_name,
+                                "type": field_type,
+                                "doc": alt.asnType().getText(),
+                                "label": raw_label,
+                            }
+                        )
+            if self.use_variant:
+                hpp.append("  /** @brief Variant of all possible alternatives */")
+                variant_alts = [alt["type"] for alt in alternatives] or [self.null_type]
+                variant_decl = "std::variant<" + ", ".join(variant_alts) + ">"
+                hpp.append(f"  {variant_decl} value;")
+            else:
+                hpp.append(
+                    "  /** @brief Indicates which CHOICE alternative is active. */"
+                )
+                hpp.append("  enum class Kind {")
+                enum_entries = ["    None"] + [
+                    f"    {alt['enum']}" for alt in alternatives
+                ]
+                hpp.append(",\n".join(enum_entries))
+                hpp.append("  };")
+                hpp.append("  Kind kind = Kind::None;")
+                if alternatives:
+                    hpp.append("")
+                    for alt in alternatives:
+                        doc_label = alt["label"] or alt["enum"]
+                        hpp.append(
+                            f"  /** @brief Alternative {doc_label} of type {alt['doc']} */"
+                        )
+                        hpp.append(f"  {alt['type']} {alt['field']};")
             hpp.append("")
             hpp.append("  std::vector<uint8_t> encode() const;")
             hpp.append("  bool decode(const std::vector<uint8_t>& data);")
@@ -686,6 +861,7 @@ class CppGenerator(ASNVisitor):
                 f" * @brief Implementation of encode/decode for ASN.1 module {self.module_name}"
             )
             cpp.append(f" * @date {date_str}")
+            cpp.append(f" * @note Target C++ standard: {self.cpp_standard}")
             cpp.append(f" * @generated by asn2cpp_antlr.py")
             cpp.append(f" */\n")
             cpp.append(f'#include "{hpp_name}"')
@@ -751,6 +927,12 @@ def main():
         default=".",
         help="Directory where generated files will be written.",
     )
+    parser.add_argument(
+        "--cpp-standard",
+        choices=["c++11", "c++14", "c++17"],
+        default="c++17",
+        help="C++ standard to target in the generated output.",
+    )
     args = parser.parse_args()
 
     input_file = args.input
@@ -767,6 +949,7 @@ def main():
         generate_cpp=not args.header_only,
         overwrite_cpp=args.overwrite_cpp,
         output_dir=args.output_dir,
+        cpp_standard=args.cpp_standard,
     )
     visitor.visit(tree)
     visitor.generate()

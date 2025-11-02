@@ -1,10 +1,10 @@
 # asn2cpp
 
-`asn2cpp` is a command-line generator that turns ASN.1 modules into pairs of C++ headers and source files. It is built on top of the ANTLR4-generated lexer and parser shipped with the repository and emits modern C++17 structures ready for custom `encode` and `decode` implementations.
+`asn2cpp` is a command-line generator that turns ASN.1 modules into pairs of C++ headers and source files. It is built on top of the ANTLR4-generated lexer and parser shipped with the repository and emits portable C++ code compatible with C++11, C++14, and C++17 standards, ready for custom `encode` and `decode` implementations.
 
 ## Highlights
 
-- Parses ASN.1 grammars and produces strongly-typed C++17 structs, enums, and `std::variant`-based CHOICE wrappers.
+- Parses ASN.1 grammars and produces strongly-typed C++ structs, enums, and CHOICE helpers that adapt to the selected C++ standard (manual tagged unions for C++11/C++14, `std::variant` for C++17).
 - Preserves existing `.cpp` implementations by default so manual logic in `encode`/`decode` functions is not overwritten.
 - Supports header-only generation and configurable output directories to fit a variety of build layouts.
 
@@ -62,6 +62,12 @@ python asn2cpp.py asn/COSEMpdu.asn --header-only
 
 Existing implementation files are preserved unless `--overwrite-cpp` is specified.
 
+Select the target C++ standard if you need something other than the default C++17 output:
+
+```bash
+python asn2cpp.py asn/COSEMpdu.asn --cpp-standard c++11
+```
+
 ## CLI reference
 
 | Flag | Description |
@@ -69,6 +75,7 @@ Existing implementation files are preserved unless `--overwrite-cpp` is specifie
 | `-o`, `--output-dir <path>` | Write generated `.hpp`/`.cpp` files to the specified directory (created if missing). |
 | `--header-only` | Generate only header files. Existing `.cpp` files remain untouched. |
 | `--overwrite-cpp` | Recreate the `.cpp` implementation even if it already exists. Ignored when `--header-only` is present. |
+| `--cpp-standard {c++11,c++14,c++17}` | Choose the C++ language standard for generated code (defaults to `c++17`). |
 | `-h`, `--help` | Show the built-in help message with the complete option list. |
 
 ## Updating dependencies
