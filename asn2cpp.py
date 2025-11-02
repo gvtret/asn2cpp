@@ -377,6 +377,129 @@ class CppGenerator(ASNVisitor):
                 element_ctx, "sequence_element", f"{name}_element"
             )
 
+    def _collect_function_specs(self):
+        specs = []
+        for name, _ in self.types:
+            specs.append(
+                {
+                    "key": f"{name}::encode",
+                    "signature": f"std::vector<uint8_t> {name}::encode() const",
+                    "return_type": "std::vector<uint8_t>",
+                    "type_name": name,
+                    "method": "encode",
+                    "body": [
+                        "  // TODO: implement ASN.1 DER/BER encoder",
+                        "  return {};",
+                    ],
+                }
+            )
+            specs.append(
+                {
+                    "key": f"{name}::decode",
+                    "signature": f"bool {name}::decode(const std::vector<uint8_t>& data)",
+                    "return_type": "bool",
+                    "type_name": name,
+                    "method": "decode",
+                    "body": [
+                        "  // TODO: implement ASN.1 DER/BER decoder",
+                        "  (void)data; return true;",
+                    ],
+                }
+            )
+        for name, _ in self.choices:
+            specs.append(
+                {
+                    "key": f"{name}::encode",
+                    "signature": f"std::vector<uint8_t> {name}::encode() const",
+                    "return_type": "std::vector<uint8_t>",
+                    "type_name": name,
+                    "method": "encode",
+                    "body": [
+                        "  // TODO: implement ASN.1 DER/BER encoder",
+                        "  return {};",
+                    ],
+                }
+            )
+            specs.append(
+                {
+                    "key": f"{name}::decode",
+                    "signature": f"bool {name}::decode(const std::vector<uint8_t>& data)",
+                    "return_type": "bool",
+                    "type_name": name,
+                    "method": "decode",
+                    "body": [
+                        "  // TODO: implement ASN.1 DER/BER decoder",
+                        "  (void)data; return true;",
+                    ],
+                }
+            )
+        return specs
+
+    def _merge_with_existing_cpp(self, cpp_path: str, function_specs):
+        with open(cpp_path, "r", encoding="utf-8") as f:
+            original_lines = f.read().splitlines()
+
+        lines = original_lines[:]
+        handled = set()
+        changed = False
+
+        for spec in function_specs:
+            exact_pattern = re.compile(
+                rf"^\s*{re.escape(spec['return_type'])}\s+{re.escape(spec['type_name'])}::{spec['method']}\s*\("
+            )
+            fallback_pattern = re.compile(
+                rf"^(\s*).{{0,120}}{re.escape(spec['type_name'])}::{spec['method']}\s*\("
+            )
+            desired = f"{spec['signature']} {{"
+            for idx, line in enumerate(lines):
+                if exact_pattern.match(line):
+                    handled.add(spec["key"])
+                    indent = re.match(r"^(\s*)", line).group(1)
+                    if line.strip() != desired:
+                        lines[idx] = indent + desired
+                        changed = True
+                    elif not line.rstrip().endswith("{"):
+                        lines[idx] = indent + desired
+                        changed = True
+                    break
+            else:
+                for idx, line in enumerate(lines):
+                    match = fallback_pattern.match(line)
+                    if match:
+                        handled.add(spec["key"])
+                        indent = match.group(1)
+                        lines[idx] = indent + desired
+                        changed = True
+                        break
+
+        missing_specs = [spec for spec in function_specs if spec["key"] not in handled]
+        if missing_specs:
+            changed = True
+            insert_index = None
+            for idx, line in enumerate(lines):
+                if line.strip() == "} // namespace DLMS":
+                    insert_index = idx
+                    break
+            if insert_index is None:
+                insert_index = len(lines)
+            insertion = []
+            if insert_index > 0 and lines[insert_index - 1].strip():
+                insertion.append("")
+            for spec in missing_specs:
+                insertion.append(f"{spec['signature']} {{")
+                insertion.extend(spec["body"])
+                insertion.append("}")
+                insertion.append("")
+            if insertion and insertion[-1] == "":
+                insertion.pop()
+            lines[insert_index:insert_index] = insertion
+
+        if changed:
+            with open(cpp_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            return "updated"
+        return "unchanged"
+
     # --- SEQUENCE ------------------------------------------------------
     def visitSequenceType(self, ctx):
         # handled in visitTypeAssignment
@@ -554,6 +677,8 @@ class CppGenerator(ASNVisitor):
 
         # --- CPP FILE ---
         cpp = []
+        function_specs = self._collect_function_specs()
+
         if self.generate_cpp:
             cpp.append(f"/**")
             cpp.append(f" * @file {cpp_name}")
@@ -565,15 +690,12 @@ class CppGenerator(ASNVisitor):
             cpp.append(f" */\n")
             cpp.append(f'#include "{hpp_name}"')
             cpp.append("namespace DLMS {\n")
-            for name, seq_ctx in self.types:
-                cpp.append(f"std::vector<uint8_t> {name}::encode() const {{")
-                cpp.append("  // TODO: implement ASN.1 DER/BER encoder")
-                cpp.append("  return {};")
-                cpp.append("}\n")
-                cpp.append(f"bool {name}::decode(const std::vector<uint8_t>& data) {{")
-                cpp.append("  // TODO: implement ASN.1 DER/BER decoder")
-                cpp.append("  (void)data; return true;")
-                cpp.append("}\n")
+            for idx, spec in enumerate(function_specs):
+                cpp.append(f"{spec['signature']} {{")
+                cpp.extend(spec["body"])
+                cpp.append("}")
+                if idx != len(function_specs) - 1:
+                    cpp.append("")
             cpp.append("} // namespace DLMS\n")
 
         # --- Write files ---
@@ -584,9 +706,15 @@ class CppGenerator(ASNVisitor):
         message = [f"Generated: {hpp_path}"]
         if self.generate_cpp:
             if os.path.exists(cpp_path) and not self.overwrite_cpp:
-                message.append(
-                    f"Preserved existing {cpp_path}; use --overwrite-cpp to regenerate."
-                )
+                status = self._merge_with_existing_cpp(cpp_path, function_specs)
+                if status == "updated":
+                    message.append(
+                        f"Updated {cpp_path} with new or revised method stubs."
+                    )
+                else:
+                    message.append(
+                        f"Preserved existing {cpp_path}; use --overwrite-cpp to regenerate."
+                    )
             else:
                 with open(cpp_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(cpp))

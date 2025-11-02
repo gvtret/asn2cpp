@@ -88,3 +88,7 @@ pip list --outdated      # Check for updates
 pip uninstall <package>  # Remove a package
 ```
 
+## Author
+
+asn2cpp was created and is maintained by Tretelnitskiy G. V. (aka "trgv").
+
